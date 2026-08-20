@@ -110,7 +110,7 @@ if __name__ == "__main__":
     # Add your YouTube video URLs to this list
     video_urls = []
 
-    # If URLs are provided via command-line arguments, use those instead
+    # If URLs are provided via command-line arguments, use those instead  
     if len(sys.argv) > 1:
         video_urls = sys.argv[1:]
 

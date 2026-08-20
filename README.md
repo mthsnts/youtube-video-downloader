@@ -34,7 +34,7 @@ python download_videos.py "https://www.youtube.com/watch?v=VIDEO_ID_1" "https://
 
 ### Method 2: Edit URL List in Script
 
-Open `download_videos.py` in your code editor and add your video links to the `video_urls` list:
+Open `download_videos.py` in your code editor and add your video links to the `video_urls` list:"
 
 ```python
 if __name__ == "__main__":
