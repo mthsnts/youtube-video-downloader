@@ -10,7 +10,7 @@ A lightweight, robust Python script powered by [`yt-dlp`](https://github.com/yt-
 - **Robust Anti-Bot Bypass**: Configured with alternative YouTube player clients (`android`, `ios`, `web`) and standard browser headers to minimize download failures.
 - **Error Recovery**: Automatically retries downloads using alternative formats and player clients if a video fails.
 
-## Prerequisites
+## Prerequisites 
 
 - **Python 3.7+**
 - **`yt-dlp`** library

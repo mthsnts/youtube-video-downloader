@@ -108,7 +108,7 @@ def download_youtube_videos(url_list, output_dir=None):
 
 if __name__ == "__main__":
     # Add your YouTube video URLs to this list
-    video_urls = []
+    video_urls = [] 
 
     # If URLs are provided via command-line arguments, use those instead  
     if len(sys.argv) > 1:
