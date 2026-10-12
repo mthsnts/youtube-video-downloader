@@ -1,54 +1,64 @@
 # YouTube Video Downloader
 
-A lightweight, robust Python script powered by [`yt-dlp`](https://github.com/yt-dlp/yt-dlp) to batch-download YouTube videos directly to your local **Downloads** folder.
+A lightweight Python downloader powered by [`yt-dlp`](https://github.com/yt-dlp/yt-dlp), with a local web interface and a command-line mode. Videos are saved to your **Downloads** folder.
 
 ## Features
 
-- **Batch Downloads**: Pass a list of YouTube URLs in the script or directly via command-line arguments.
-- **Auto-Cleaning URLs**: Automatically strips extra playlist/radio parameters (e.g., `&list=RD...`, `&index=...`) to prevent "Video not available" errors.
-- **No FFmpeg Required**: Automatically detects if `ffmpeg` is installed. If missing, it downloads high-quality pre-merged single-stream videos without requiring `ffmpeg` merging.
-- **Robust Anti-Bot Bypass**: Configured with alternative YouTube player clients (`android`, `ios`, `web`) and standard browser headers to minimize download failures.
-- **Error Recovery**: Automatically retries downloads using alternative formats and player clients if a video fails.
+- **Local web interface**: paste a link, pick the format and download, with live progress for each job.
+- **Playlist picker**: paste a playlist link and every video shows up as a card with thumbnail, title and duration. Choose exactly which videos to download.
+- **Video or audio**: MP4, WebM and MKV video, or audio-only MP3 and M4A.
+- **Clip a segment**: set a start and/or end timestamp to download only part of a video.
+- **Batch downloads** from the command line.
+- **Auto-cleaning URLs**: strips extra playlist/radio parameters (e.g. `&list=RD...`, `&index=...`) from single-video links to avoid "Video not available" errors.
+- **Works without FFmpeg** for plain MP4 downloads, falling back to pre-merged single-stream videos.
+- **Error recovery**: retries failed downloads with alternative formats and YouTube player clients.
 
-## Prerequisites 
+## Prerequisites
 
 - **Python 3.7+**
-- **`yt-dlp`** library
-
-Install `yt-dlp` via pip:
-```bash
-pip install -U yt-dlp
-```
-
-> **Note**: `ffmpeg` is optional. If installed on your system, the script will use it to merge separate ultra-HD video and audio streams for maximum quality. If not installed, it safely falls back to pre-merged streams.
+- **`yt-dlp`**:
+  ```bash
+  pip install -U yt-dlp
+  ```
+- **`ffmpeg`** (optional): needed for trimming, audio extraction (MP3/M4A), WebM/MKV, and for merging separate high-quality video and audio streams. Without it, only full MP4 downloads are available.
 
 ## Usage
 
-### Web Interface
-
-Start the local web interface (it opens in your browser at `http://127.0.0.1:8000`):
+### Web interface
 
 ```bash
 python web_ui.py
 ```
 
-Paste a video or playlist link, pick the file format (MP4, WebM, MKV, or audio-only MP3/M4A), and optionally set a start and end timestamp (`hh:mm:ss`, `mm:ss` or seconds) to download just that segment. When you paste a playlist link, its videos show up as cards with thumbnail and title: pick which ones to download (all are selected by default, with **Selecionar todos** / **Nenhum** shortcuts). The format and timestamps apply to every selected video. Progress is shown below the form and files are saved to your `Downloads` folder.
+The interface opens in your browser at `http://127.0.0.1:8000`.
 
-Use `--port` to pick another port and `--no-browser` to skip opening the browser.
+1. Paste a video or playlist link.
+2. Pick the file format.
+3. Optionally fill in **Início** and **Fim** (`hh:mm:ss`, `mm:ss` or seconds) to keep only that segment. Leave both blank for the full video.
+4. Click **Baixar**. Progress for each download appears below the form.
 
-> **Note**: trimming, audio extraction and formats other than MP4 require `ffmpeg`.
+**Playlists**: when the link contains a playlist (`list=`), the videos load as cards below the link field.
 
-### Method 1: Command Line Arguments
+- Every video starts selected. Click a card to select or unselect it, or use **Selecionar todos** / **Nenhum**.
+- A counter shows how many videos are selected.
+- Private or deleted videos are shown greyed out and can't be selected.
+- If the link points to a single video inside a playlist (`watch?v=...&list=...`), only that video starts selected; the rest of the playlist is there to add.
+- The format and the start/end timestamps apply to every selected video.
 
-Pass one or multiple YouTube video URLs directly when running the script:
+Options:
+
+- `--port 8080` serves the interface on another port.
+- `--no-browser` skips opening the browser automatically.
+
+### Command line
+
+Pass one or more video URLs:
 
 ```bash
 python download_videos.py "https://www.youtube.com/watch?v=VIDEO_ID_1" "https://www.youtube.com/watch?v=VIDEO_ID_2"
 ```
 
-### Method 2: Edit URL List in Script
-
-Open `download_videos.py` in your code editor and add your video links to the `video_urls` list:"
+Or add them to the `video_urls` list in `download_videos.py`:
 
 ```python
 if __name__ == "__main__":
@@ -58,17 +68,22 @@ if __name__ == "__main__":
     ]
 ```
 
-Then run:
+and run:
 
 ```bash
 python download_videos.py
 ```
 
-## Output Location
+The command line downloads MP4 videos in full; formats, trimming and playlist selection are available in the web interface.
 
-Downloaded videos are saved automatically to your operating system's default `Downloads` folder:
+## Output location
+
+Files are saved to your operating system's `Downloads` folder:
+
 - **Windows**: `C:\Users\<YourUsername>\Downloads`
 - **macOS / Linux**: `~/Downloads`
+
+Clipped segments get the start and end times in brackets in the file name.
 
 ## License
 
