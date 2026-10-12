@@ -27,12 +27,48 @@ def clean_youtube_url(url):
     return url
 
 
-def download_youtube_videos(url_list, output_dir=None):
+VIDEO_FORMATS = ("mp4", "webm", "mkv")
+AUDIO_FORMATS = ("mp3", "m4a")
+
+
+def parse_timestamp(value):
+    """
+    Converts a timestamp such as "90", "1:30" or "01:02:03.5" into seconds.
+    Returns None for empty values and raises ValueError for invalid ones.
+    """
+    if value is None:
+        return None
+    value = str(value).strip()
+    if not value:
+        return None
+    parts = value.split(":")
+    if len(parts) > 3:
+        raise ValueError(f"Invalid timestamp: {value}")
+    try:
+        numbers = [float(part) for part in parts]
+    except ValueError:
+        raise ValueError(f"Invalid timestamp: {value}")
+    if any(n < 0 for n in numbers):
+        raise ValueError(f"Invalid timestamp: {value}")
+    seconds = 0.0
+    for n in numbers:
+        seconds = seconds * 60 + n
+    return seconds
+
+
+def download_youtube_videos(url_list, output_dir=None, file_format="mp4", start=None, end=None,
+                            playlist=False, progress_hooks=None):
     """
     Downloads YouTube videos given a list of URLs into the specified output directory.
 
     :param url_list: List of YouTube URL strings
     :param output_dir: Directory path to save videos (defaults to user's Downloads folder)
+    :param file_format: One of VIDEO_FORMATS or AUDIO_FORMATS
+    :param start: Optional start of the segment to keep (seconds or "hh:mm:ss")
+    :param end: Optional end of the segment to keep (seconds or "hh:mm:ss")
+    :param playlist: Download the whole playlist when the URL points to one
+    :param progress_hooks: Optional list of yt-dlp progress hooks
+    :return: List of (url, error message) tuples for failed downloads
     """
     if output_dir is None:
         output_dir = Path.home() / "Downloads"
@@ -41,19 +77,37 @@ def download_youtube_videos(url_list, output_dir=None):
 
     import shutil
 
+    if file_format not in VIDEO_FORMATS + AUDIO_FORMATS:
+        raise ValueError(f"Unsupported format: {file_format}")
+
+    start = parse_timestamp(start)
+    end = parse_timestamp(end)
+    if start is not None and end is not None and end <= start:
+        raise ValueError("End timestamp must be after start timestamp")
+    trimming = start is not None or end is not None
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     has_ffmpeg = shutil.which("ffmpeg") is not None
     if not has_ffmpeg:
+        if file_format != "mp4" or trimming:
+            raise RuntimeError("'ffmpeg' is required for audio extraction, trimming and formats other than mp4.")
         print("Note: 'ffmpeg' not detected in system PATH.")
         print("Downloading single-file streams directly (no ffmpeg merging required).\n")
 
-    format_spec = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' if has_ffmpeg else 'best[ext=mp4]/best'
+    if file_format in AUDIO_FORMATS:
+        format_spec = 'bestaudio/best'
+    elif file_format == "mp4":
+        format_spec = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best' if has_ffmpeg else 'best[ext=mp4]/best'
+    elif file_format == "webm":
+        format_spec = 'bestvideo[ext=webm]+bestaudio[ext=webm]/best[ext=webm]/bestvideo+bestaudio/best'
+    else:
+        format_spec = 'bestvideo+bestaudio/best'
 
     ydl_opts = {
         'format': format_spec,
         'outtmpl': str(output_dir / '%(title)s.%(ext)s'),
-        'noplaylist': True,
+        'noplaylist': not playlist,
         'quiet': False,
         'no_warnings': False,
         'extractor_args': {
@@ -66,11 +120,36 @@ def download_youtube_videos(url_list, output_dir=None):
         }
     }
 
+    if file_format in AUDIO_FORMATS:
+        ydl_opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': file_format,
+            'preferredquality': '0',
+        }]
+    elif file_format == "webm":
+        # Re-encodes only when the source has no webm streams
+        ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'webm'}]
+    elif has_ffmpeg:
+        ydl_opts['merge_output_format'] = file_format
+        if file_format == "mkv":
+            ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoRemuxer', 'preferedformat': file_format}]
+
+    if trimming:
+        from yt_dlp.utils import download_range_func
+        ydl_opts['download_ranges'] = download_range_func(None, [(start or 0, end if end is not None else float('inf'))])
+        ydl_opts['force_keyframes_at_cuts'] = True
+        ydl_opts['outtmpl'] = str(output_dir / '%(title)s [%(section_start)s-%(section_end)s].%(ext)s')
+
+    if progress_hooks:
+        ydl_opts['progress_hooks'] = list(progress_hooks)
+
+    failures = []
+
     print(f"Target Download Folder: {output_dir}\n")
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         for index, raw_url in enumerate(url_list, start=1):
-            url = clean_youtube_url(raw_url.strip())
+            url = raw_url.strip() if playlist else clean_youtube_url(raw_url.strip())
             print(f"[{index}/{len(url_list)}] Processing URL: {url}")
             try:
                 ydl.download([url])
@@ -104,6 +183,9 @@ def download_youtube_videos(url_list, output_dir=None):
                         e = alt_err
 
                 print(f" Failed to download video {index}: {e}\n")
+                failures.append((url, str(e)))
+
+    return failures
 
 
 if __name__ == "__main__":
