@@ -13,6 +13,8 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import yt_dlp
+
 from download_videos import AUDIO_FORMATS, VIDEO_FORMATS, download_youtube_videos, parse_timestamp
 
 JOBS = {}
@@ -38,7 +40,7 @@ def run_job(job_id, options):
                     JOBS[job_id]["files"].append(filename)
 
     try:
-        failures = download_youtube_videos([options["url"]], progress_hooks=[hook], **{
+        failures = download_youtube_videos(options["videos"] or [options["url"]], progress_hooks=[hook], **{
             k: options[k] for k in ("file_format", "start", "end", "playlist")
         })
         if failures:
@@ -49,10 +51,49 @@ def run_job(job_id, options):
         update_job(job_id, status="error", error=str(e))
 
 
-def validate(payload):
-    url = str(payload.get("url", "")).strip()
+UNAVAILABLE_TITLES = ("[Private video]", "[Deleted video]")
+
+
+def list_playlist(url):
+    """Returns the playlist title and its videos (id, url, title, thumbnail, duration) without downloading."""
+    opts = {"extract_flat": "in_playlist", "skip_download": True, "quiet": True, "no_warnings": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info.get("_type") not in ("playlist", "multi_video"):
+        raise ValueError("Esse link não é de uma playlist.")
+
+    videos = []
+    for entry in info.get("entries") or []:
+        if not entry or not entry.get("id"):
+            continue
+        video_id = entry["id"]
+        thumbnails = entry.get("thumbnails") or []
+        title = entry.get("title") or video_id
+        videos.append({
+            "id": video_id,
+            "url": entry.get("url") if str(entry.get("url", "")).startswith("http")
+            else f"https://www.youtube.com/watch?v={video_id}",
+            "title": title,
+            "thumbnail": thumbnails[-1]["url"] if thumbnails else f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+            "duration": entry.get("duration"),
+            "available": title not in UNAVAILABLE_TITLES,
+        })
+    return {"title": info.get("title") or "Playlist", "videos": videos}
+
+
+def check_url(url):
+    url = str(url or "").strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError("Informe um link válido (http:// ou https://).")
+    return url
+
+
+def validate(payload):
+    url = check_url(payload.get("url"))
+    videos = payload.get("videos") or []
+    if not isinstance(videos, list):
+        raise ValueError("Lista de vídeos inválida.")
+    videos = [check_url(v) for v in videos]
     file_format = payload.get("format", "mp4")
     if file_format not in VIDEO_FORMATS + AUDIO_FORMATS:
         raise ValueError(f"Formato não suportado: {file_format}")
@@ -68,8 +109,16 @@ def validate(payload):
         "file_format": file_format,
         "start": start,
         "end": end,
-        "playlist": bool(payload.get("playlist")),
+        "playlist": bool(payload.get("playlist")) and not videos,
+        "videos": videos,
     }
+
+
+def payload_label(options):
+    count = len(options["videos"])
+    if count:
+        return f"{count} vídeo{'s' if count > 1 else ''} da playlist"
+    return options["url"]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -97,6 +146,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(404, {"error": "Not found"})
 
     def do_POST(self):
+        if self.path == "/api/playlist":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                url = check_url(json.loads(self.rfile.read(length) or b"{}").get("url"))
+                self.send_json(200, list_playlist(url))
+            except (ValueError, json.JSONDecodeError) as e:
+                self.send_json(400, {"error": str(e)})
+            except Exception as e:
+                self.send_json(502, {"error": f"Não foi possível ler a playlist: {e}"})
+            return
         if self.path != "/api/download":
             self.send_json(404, {"error": "Not found"})
             return
@@ -112,6 +171,7 @@ class Handler(BaseHTTPRequestHandler):
             JOBS[job_id] = {
                 "id": job_id,
                 "url": options["url"],
+                "label": payload_label(options),
                 "format": options["file_format"],
                 "status": "running",
                 "percent": None,
@@ -139,7 +199,7 @@ PAGE = """<!doctype html>
   }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-  main { max-width: 640px; margin: 40px auto; padding: 0 16px; }
+  main { max-width: 760px; margin: 40px auto; padding: 0 16px; }
   h1 { font-size: 1.5rem; margin-bottom: 24px; }
   form, .job { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
   label { display: block; font-size: .875rem; color: var(--muted); margin: 14px 0 6px; }
@@ -155,6 +215,21 @@ PAGE = """<!doctype html>
   .job .url { word-break: break-all; color: var(--muted); }
   .bar { height: 6px; background: var(--border); border-radius: 3px; margin-top: 8px; overflow: hidden; }
   .bar div { height: 100%; background: var(--accent); transition: width .3s; }
+  #playlist { margin-top: 16px; }
+  #playlist[hidden] { display: none; }
+  .pl-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 10px; }
+  .pl-head strong { flex: 1 1 100%; }
+  .pl-count { color: var(--muted); font-size: .875rem; flex: 1; }
+  .link { margin: 0; width: auto; padding: 4px 8px; background: transparent; color: var(--accent); font-size: .875rem; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; max-height: 460px; overflow-y: auto; padding: 2px; }
+  .card { position: relative; border: 2px solid var(--border); border-radius: 10px; overflow: hidden; cursor: pointer; background: var(--bg); margin: 0; color: var(--text); font-size: .85rem; }
+  .card.selected { border-color: var(--accent); }
+  .card.disabled { opacity: .45; cursor: not-allowed; }
+  .card img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: var(--border); }
+  .card input { position: absolute; top: 8px; left: 8px; width: 18px; height: 18px; accent-color: var(--accent); }
+  .card .dur { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,.75); color: #fff; font-size: .75rem; padding: 1px 5px; border-radius: 4px; }
+  .card .title { margin: 8px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .loading { color: var(--muted); font-size: .9rem; }
 </style>
 </head>
 <body>
@@ -163,7 +238,8 @@ PAGE = """<!doctype html>
   <form id="form">
     <label for="url">Link do vídeo ou playlist</label>
     <input id="url" type="url" required placeholder="https://www.youtube.com/watch?v=...">
-    <label class="check"><input id="playlist" type="checkbox"> Baixar a playlist inteira</label>
+    <div class="hint">Cole um link de playlist para escolher quais vídeos baixar.</div>
+    <div id="playlist" hidden></div>
 
     <label for="format">Formato do arquivo</label>
     <select id="format">
@@ -199,11 +275,118 @@ PAGE = """<!doctype html>
 const form = document.getElementById("form");
 const errorEl = document.getElementById("error");
 const jobsEl = document.getElementById("jobs");
+const urlEl = document.getElementById("url");
+const playlistEl = document.getElementById("playlist");
 const STATUS = { running: "Baixando...", done: "Concluído", error: "Erro" };
+let playlist = null;      // { title, videos } of the loaded playlist
+let selected = new Set(); // ids of the selected videos
+let loadedUrl = "";
+let loadToken = 0;
+
+function playlistUrl(value) {
+  try {
+    const u = new URL(value.trim());
+    return u.searchParams.get("list") ? u.href : null;
+  } catch { return null; }
+}
+
+function fmtDuration(sec) {
+  if (sec == null) return "";
+  sec = Math.round(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  const mm = h ? String(m).padStart(2, "0") : m;
+  return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
+}
+
+async function loadPlaylist() {
+  const url = playlistUrl(urlEl.value);
+  if (url === loadedUrl) return;
+  loadedUrl = url;
+  playlist = null;
+  selected = new Set();
+  const token = ++loadToken;
+  if (!url) { playlistEl.hidden = true; playlistEl.innerHTML = ""; return; }
+  playlistEl.hidden = false;
+  playlistEl.innerHTML = '<div class="loading">Carregando vídeos da playlist...</div>';
+  try {
+    const res = await fetch("/api/playlist", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
+    const data = await res.json();
+    if (token !== loadToken) return;
+    if (!res.ok) throw new Error(data.error);
+    playlist = data;
+    // A watch link inside a playlist preselects just that video; a playlist link selects everything
+    const current = new URL(url).searchParams.get("v");
+    const available = data.videos.filter((v) => v.available);
+    const preselect = current && available.some((v) => v.id === current) ? [current] : available.map((v) => v.id);
+    selected = new Set(preselect);
+    renderPlaylist();
+  } catch (err) {
+    if (token !== loadToken) return;
+    playlistEl.innerHTML = '<div class="error">' + escape(err.message) + "</div>";
+  }
+}
+
+function renderPlaylist() {
+  playlistEl.innerHTML = `<div class="pl-head">
+      <strong>${escape(playlist.title)}</strong>
+      <span class="pl-count" id="pl-count"></span>
+      <button type="button" class="link" data-select="all">Selecionar todos</button>
+      <button type="button" class="link" data-select="none">Nenhum</button>
+    </div>
+    <div class="cards">${playlist.videos.map((v) => `
+      <label class="card${v.available ? "" : " disabled"}" data-id="${escape(v.id)}">
+        <img src="${escape(v.thumbnail)}" alt="" loading="lazy">
+        <input type="checkbox" ${v.available ? "" : "disabled"}>
+        ${v.duration ? `<span class="dur">${fmtDuration(v.duration)}</span>` : ""}
+        <div class="title" title="${escape(v.title)}">${escape(v.title)}</div>
+      </label>`).join("")}
+    </div>`;
+  syncSelection();
+}
+
+function syncSelection() {
+  playlistEl.querySelectorAll(".card").forEach((card) => {
+    const on = selected.has(card.dataset.id);
+    card.classList.toggle("selected", on);
+    card.querySelector("input").checked = on;
+  });
+  const count = playlistEl.querySelector("#pl-count");
+  if (count) count.textContent = selected.size + " de " + playlist.videos.length + " selecionados";
+}
+
+playlistEl.addEventListener("change", (e) => {
+  const card = e.target.closest(".card");
+  if (!card) return;
+  if (e.target.checked) selected.add(card.dataset.id); else selected.delete(card.dataset.id);
+  syncSelection();
+});
+
+playlistEl.addEventListener("click", (e) => {
+  const mode = e.target.dataset && e.target.dataset.select;
+  if (!mode || !playlist) return;
+  selected = new Set(mode === "all" ? playlist.videos.filter((v) => v.available).map((v) => v.id) : []);
+  syncSelection();
+});
+
+let debounce;
+urlEl.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(loadPlaylist, 400); });
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
   errorEl.textContent = "";
+  if (playlistUrl(urlEl.value) && !playlist) {
+    errorEl.textContent = "Aguarde a lista de vídeos da playlist carregar.";
+    return;
+  }
+  const videos = playlist ? playlist.videos.filter((v) => selected.has(v.id)).map((v) => v.url) : [];
+  if (playlist && !videos.length) {
+    errorEl.textContent = "Selecione pelo menos um vídeo da playlist.";
+    return;
+  }
   const button = document.getElementById("submit");
   button.disabled = true;
   try {
@@ -211,8 +394,8 @@ form.addEventListener("submit", async (e) => {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        url: document.getElementById("url").value,
-        playlist: document.getElementById("playlist").checked,
+        url: urlEl.value,
+        videos,
         format: document.getElementById("format").value,
         start: document.getElementById("start").value,
         end: document.getElementById("end").value,
@@ -220,7 +403,8 @@ form.addEventListener("submit", async (e) => {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error);
-    document.getElementById("url").value = "";
+    urlEl.value = "";
+    loadPlaylist();
     refresh();
   } catch (err) {
     errorEl.textContent = err.message;
@@ -244,7 +428,7 @@ async function refresh() {
       : escape(job.current) + (job.percent == null ? "" : " (" + pct + "%)");
     return `<div class="job">
       <strong>${STATUS[job.status]}</strong> · ${escape(job.format.toUpperCase())}
-      <div class="url">${escape(job.url)}</div>
+      <div class="url">${escape(job.label || job.url)}</div>
       <div>${detail}</div>
       ${job.status === "running" ? `<div class="bar"><div style="width:${pct}%"></div></div>` : ""}
     </div>`;

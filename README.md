@@ -32,7 +32,7 @@ Start the local web interface (it opens in your browser at `http://127.0.0.1:800
 python web_ui.py
 ```
 
-Paste a video or playlist link, pick the file format (MP4, WebM, MKV, or audio-only MP3/M4A), and optionally set a start and end timestamp (`hh:mm:ss`, `mm:ss` or seconds) to download just that segment. Check **Baixar a playlist inteira** to download every video of a playlist. Progress is shown below the form and files are saved to your `Downloads` folder.
+Paste a video or playlist link, pick the file format (MP4, WebM, MKV, or audio-only MP3/M4A), and optionally set a start and end timestamp (`hh:mm:ss`, `mm:ss` or seconds) to download just that segment. When you paste a playlist link, its videos show up as cards with thumbnail and title: pick which ones to download (all are selected by default, with **Selecionar todos** / **Nenhum** shortcuts). The format and timestamps apply to every selected video. Progress is shown below the form and files are saved to your `Downloads` folder.
 
 Use `--port` to pick another port and `--no-browser` to skip opening the browser.
 
