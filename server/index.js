@@ -7,12 +7,14 @@
 //   API_KEY           Optional password. When set, every API call must send it.
 //   FILE_TTL_MINUTES  How long finished files stay available for download (default 60).
 //   MAX_CONCURRENT    How many downloads run at the same time (default 2).
+//   YT_COOKIES_FILE / YT_COOKIES   YouTube cookies for servers YouTube blocks (see server/cookies.js).
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import archiver from "archiver";
 import express from "express";
+import { getCookiesPath, setupCookies } from "./cookies.js";
 import { createJob, getJob, jobDir, publicJob, startCleanup } from "./jobs.js";
 import { AUDIO_FORMATS, VIDEO_FORMATS, listPlaylist, parseTimestamp } from "./ytdlp.js";
 
@@ -64,7 +66,7 @@ export function createApi() {
   const api = express.Router();
   api.use(express.json({ limit: "1mb" }));
 
-  api.get("/health", (req, res) => res.json({ ok: true, auth: Boolean(API_KEY) }));
+  api.get("/health", (req, res) => res.json({ ok: true, auth: Boolean(API_KEY), cookies: Boolean(getCookiesPath()) }));
   api.use(auth);
 
   api.post("/playlist", async (req, res) => {
@@ -124,6 +126,7 @@ export function createApi() {
 
 async function main() {
   startCleanup();
+  setupCookies();
   const app = express();
   app.disable("x-powered-by");
   app.use("/api", createApi());

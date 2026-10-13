@@ -78,10 +78,31 @@ Videos are downloaded on the server, in a temporary folder, and then sent to you
 Notes:
 
 - yt-dlp is downloaded when the image is built, so a new deploy (**Manual Deploy > Clear build cache & deploy**) updates it. Do this when YouTube downloads start failing.
-- YouTube sometimes blocks downloads from cloud servers ("Sign in to confirm you're not a bot"). If that happens, run the app on your own computer (`docker run` or `npm start`) and expose it with [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (`cloudflared tunnel --url http://localhost:8000`).
+- YouTube often blocks cloud servers with "Sign in to confirm you're not a bot". See [YouTube cookies](#youtube-cookies-sign-in-to-confirm-youre-not-a-bot) below.
 - Render's free plan sleeps after a while without use, so the first request can take up to a minute, and its disk is temporary (fine here, since files are deleted after an hour anyway).
 
 The same `Dockerfile` works on Railway, Fly.io or any VPS.
+
+### YouTube cookies ("Sign in to confirm you're not a bot")
+
+YouTube treats most datacenter addresses (Render, Railway, Fly.io...) as bots and refuses to serve videos to them. Cookies from a logged-in YouTube account get past that check, so the server can use a `cookies.txt` file.
+
+**Use a separate Google account, not your main one.** The cookies give full access to that account, and YouTube can flag or suspend accounts used by automated downloaders.
+
+1. **Export the cookies** (Netscape `cookies.txt` format) in a way YouTube won't immediately rotate them:
+   1. Open a private/incognito window and log in to YouTube with the separate account.
+   2. In the same tab, open `https://www.youtube.com/robots.txt`.
+   3. Export the cookies of `youtube.com` with an extension such as **Get cookies.txt LOCALLY** (Chrome/Edge) or **cookies.txt** (Firefox), allowing it in private windows.
+   4. Close the private window right away, without logging out. Logging out or browsing YouTube in that session invalidates the exported cookies.
+
+   Alternatively, with yt-dlp installed on your computer and the account logged in on Firefox: `yt-dlp --cookies-from-browser firefox --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=dQw4w9WgXcQ"` (extracting from Chrome on Windows usually fails).
+2. **Give them to the server**. On Render, open the service, **Environment > Secret Files**, add a file named `cookies.txt` with the file's content, and save (Render redeploys). The server finds it at `/etc/secrets/cookies.txt`.
+   Other hosts: set `YT_COOKIES_FILE` to the file's path, or put the content (plain or base64) in the `YT_COOKIES` variable.
+3. Open `https://<your-service>.onrender.com/api/health`: it should show `"cookies": true`. The server log also says `Usando cookies do YouTube.`
+
+When the cookies expire, the interface says so: export new ones and replace the Secret File.
+
+Cookies don't always solve it: YouTube can still block a datacenter address (or ask for the account to be verified), and a new yt-dlp release is often needed when YouTube changes something (**Manual Deploy > Clear build cache & deploy** fetches it). If downloads keep failing on the server, run the same container on your own computer, where your home connection isn't blocked (`docker run -p 8000:8000 ytdl`, or `npm start`), and use it from other devices on the same Wi-Fi or through [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (`cloudflared tunnel --url http://localhost:8000`).
 
 ### Settings
 
@@ -91,6 +112,8 @@ The same `Dockerfile` works on Railway, Fly.io or any VPS.
 | `PORT` | `8000` | Port to listen on (Render sets it) |
 | `FILE_TTL_MINUTES` | `60` | How long finished files stay available |
 | `MAX_CONCURRENT` | `2` | Downloads running at the same time |
+| `YT_COOKIES_FILE` | `/etc/secrets/cookies.txt` if present | Path to a YouTube `cookies.txt` |
+| `YT_COOKIES` | empty | Content of a YouTube `cookies.txt` (plain or base64) |
 | `YTDLP_PATH` | `yt-dlp` | Path to another yt-dlp binary |
 
 ## Command line (optional)
