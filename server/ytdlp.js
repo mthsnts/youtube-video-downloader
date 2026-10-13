@@ -1,6 +1,7 @@
 // Builds yt-dlp commands and runs them as child processes. yt-dlp and ffmpeg must be on the PATH
 // (the Dockerfile installs both); YTDLP_PATH points to another yt-dlp binary.
 import { spawn } from "node:child_process";
+import { getCookiesPath } from "./cookies.js";
 
 export const YTDLP = process.env.YTDLP_PATH || "yt-dlp";
 export const VIDEO_FORMATS = ["mp4", "webm", "mkv"];
@@ -10,7 +11,20 @@ const UNAVAILABLE_TITLES = new Set(["[Private video]", "[Deleted video]"]);
 const PROGRESS_PREFIX = "@@progress ";
 
 // yt-dlp needs a JavaScript runtime to solve YouTube's challenges; Node is already here, so use it.
-const COMMON_ARGS = ["--js-runtimes", "node", "--no-warnings", "--no-color"];
+const BASE_ARGS = ["--js-runtimes", "node", "--no-warnings", "--no-color"];
+
+function commonArgs() {
+  const cookies = getCookiesPath();
+  return cookies ? [...BASE_ARGS, "--cookies", cookies] : BASE_ARGS;
+}
+
+/** Turns YouTube's bot check into a message that says what to do about it. */
+export function friendlyError(message, hasCookies = Boolean(getCookiesPath())) {
+  if (!/confirm you.re not a bot|Sign in to confirm/i.test(message)) return message;
+  return hasCookies
+    ? "O YouTube bloqueou o servidor mesmo com os cookies configurados. Eles provavelmente expiraram: exporte cookies novos e atualize-os no servidor (veja o README)."
+    : "O YouTube bloqueou o servidor (\"Sign in to confirm you're not a bot\"). Configure cookies do YouTube no servidor para liberar os downloads (veja o README).";
+}
 
 /** Converts "90", "1:30" or "01:02:03.5" into seconds. Returns null when empty, throws when invalid. */
 export function parseTimestamp(value) {
@@ -59,7 +73,7 @@ export function downloadArgs(url, { format, start = null, end = null, outDir, pl
   const trimming = start != null || end != null;
   const name = trimming ? "%(title)s [%(section_start)s-%(section_end)s].%(ext)s" : "%(title)s.%(ext)s";
   const args = [
-    ...COMMON_ARGS,
+    ...commonArgs(),
     "--no-playlist",
     "--newline",
     "--windows-filenames",
@@ -117,7 +131,7 @@ export function runYtdlp(args, { onLine, signal } = {}) {
       const errors = stderr.split("\n").filter((l) => l.startsWith("ERROR:"));
       const message = (errors.pop() || stderr.trim().split("\n").pop() || `yt-dlp saiu com código ${code}`)
         .replace(/^ERROR:\s*/, "");
-      reject(new Error(message));
+      reject(new Error(friendlyError(message)));
     });
   });
 }
@@ -141,7 +155,7 @@ export async function downloadVideo(url, options, onProgress) {
 
 /** Lists a playlist's videos (id, url, title, thumbnail, duration) without downloading them. */
 export async function listPlaylist(url) {
-  const output = await runYtdlp([...COMMON_ARGS, "--flat-playlist", "--yes-playlist", "-J", "--", url]);
+  const output = await runYtdlp([...commonArgs(), "--flat-playlist", "--yes-playlist", "-J", "--", url]);
   return playlistFromInfo(JSON.parse(output));
 }
 
