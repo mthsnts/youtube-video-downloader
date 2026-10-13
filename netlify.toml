@@ -1,0 +1,10 @@
+# Netlify hosts only the static interface in public/. The downloads run on the Python backend
+# (web_ui.py), hosted separately; set its address in the API_URL environment variable on Netlify.
+[build]
+  publish = "public"
+  command = "printf 'window.API_URL = \"%s\";\n' \"${API_URL:-}\" > public/config.js"
+
+[[headers]]
+  for = "/config.js"
+  [headers.values]
+    Cache-Control = "no-cache"

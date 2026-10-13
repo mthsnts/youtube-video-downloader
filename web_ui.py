@@ -1,21 +1,52 @@
 """
-Local web interface for download_videos.py.
+Web interface and API for download_videos.py.
 
-Run it with:
+Run it locally with:
     python web_ui.py
 
 Then open http://127.0.0.1:8000 (the browser opens automatically).
+
+Run it as a server reachable by other devices (or on a host such as Render) with:
+    python web_ui.py --host 0.0.0.0
+
+Downloads happen on the server in a temporary folder and are then sent to the browser
+as a regular file download, so they land on whatever device opened the page.
+
+Environment variables:
+    PORT              Port to listen on (overrides --port).
+    ALLOWED_ORIGINS   Comma separated origins allowed to call the API (CORS), e.g.
+                      "https://my-site.netlify.app". Defaults to "*".
+    API_KEY           Optional password. When set, every API call must send it.
+    FILE_TTL_MINUTES  How long finished files stay available for download (default 60).
+    MAX_CONCURRENT    How many downloads run at the same time (default 2).
 """
 import argparse
 import json
+import mimetypes
+import os
+import secrets
+import shutil
+import tempfile
 import threading
-import uuid
+import time
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlparse
 
 import yt_dlp
 
 from download_videos import AUDIO_FORMATS, VIDEO_FORMATS, download_youtube_videos, parse_timestamp
+
+PUBLIC_DIR = Path(__file__).resolve().parent / "public"
+STATIC_FILES = {"/": "index.html", "/index.html": "index.html", "/config.js": "config.js"}
+WORK_DIR = Path(tempfile.gettempdir()) / "yt-downloader-jobs"
+
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+API_KEY = os.environ.get("API_KEY", "")
+FILE_TTL = int(os.environ.get("FILE_TTL_MINUTES", "60")) * 60
+DOWNLOAD_SLOTS = threading.Semaphore(int(os.environ.get("MAX_CONCURRENT", "2")))
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
@@ -26,29 +57,56 @@ def update_job(job_id, **fields):
         JOBS[job_id].update(fields)
 
 
+def job_files(job_dir):
+    """Finished files of a job, ignoring partial downloads and yt-dlp leftovers."""
+    return sorted(
+        p.name for p in job_dir.iterdir()
+        if p.is_file() and not p.name.endswith((".part", ".ytdl", ".temp", ".zip", ".tmp"))
+    )
+
+
 def run_job(job_id, options):
+    job_dir = WORK_DIR / job_id
+
     def hook(d):
-        filename = d.get("info_dict", {}).get("title") or d.get("filename", "")
+        title = d.get("info_dict", {}).get("title") or os.path.basename(d.get("filename", ""))
         if d["status"] == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             percent = round(d["downloaded_bytes"] * 100 / total, 1) if total else None
-            update_job(job_id, current=filename, percent=percent)
+            update_job(job_id, current=title, percent=percent)
         elif d["status"] == "finished":
-            with JOBS_LOCK:
-                JOBS[job_id]["percent"] = 100
-                if filename not in JOBS[job_id]["files"]:
-                    JOBS[job_id]["files"].append(filename)
+            update_job(job_id, current=title, percent=100)
 
-    try:
-        failures = download_youtube_videos(options["videos"] or [options["url"]], progress_hooks=[hook], **{
-            k: options[k] for k in ("file_format", "start", "end", "playlist")
-        })
-        if failures:
-            update_job(job_id, status="error", error="; ".join(err for _, err in failures))
-        else:
-            update_job(job_id, status="done", percent=100)
-    except Exception as e:
-        update_job(job_id, status="error", error=str(e))
+    with DOWNLOAD_SLOTS:
+        update_job(job_id, status="running")
+        try:
+            failures = download_youtube_videos(
+                options["videos"] or [options["url"]], output_dir=job_dir, progress_hooks=[hook],
+                **{k: options[k] for k in ("file_format", "start", "end", "playlist")},
+            )
+            files = job_files(job_dir) if job_dir.exists() else []
+            error = "; ".join(err for _, err in failures) or None
+            if files:
+                # Partial playlist failures still deliver the videos that worked
+                update_job(job_id, status="done", percent=100, files=files, error=error)
+            else:
+                update_job(job_id, status="error", error=error or "Nenhum arquivo foi gerado.")
+        except Exception as e:
+            update_job(job_id, status="error", error=str(e))
+        update_job(job_id, finished_at=time.time())
+
+
+def cleanup_loop():
+    """Forgets finished jobs and deletes their files once they are older than FILE_TTL."""
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with JOBS_LOCK:
+            expired = [jid for jid, job in JOBS.items() if job["finished_at"] and now - job["finished_at"] > FILE_TTL]
+            for jid in expired:
+                del JOBS[jid]
+        for jid in expired:
+            shutil.rmtree(WORK_DIR / jid, ignore_errors=True)
 
 
 UNAVAILABLE_TITLES = ("[Private video]", "[Deleted video]")
@@ -121,63 +179,152 @@ def payload_label(options):
     return options["url"]
 
 
+def public_job(job):
+    return {k: job[k] for k in ("id", "url", "label", "format", "status", "percent", "current", "files", "error")}
+
+
+def content_disposition(name):
+    fallback = name.encode("ascii", "replace").decode().replace('"', "'").replace("?", "_")
+    return f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name)}"
+
+
 class Handler(BaseHTTPRequestHandler):
+    def cors_headers(self):
+        origin = self.headers.get("Origin")
+        if "*" in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        elif origin in ALLOWED_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Api-Key")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+
     def send_json(self, status, data):
         body = json.dumps(data).encode("utf-8")
         self.send_response(status)
+        self.cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def send_file(self, path, content_type, download_name=None):
+        self.send_response(200)
+        self.cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(path.stat().st_size))
+        if download_name:
+            self.send_header("Content-Disposition", content_disposition(download_name))
+        self.end_headers()
+        with open(path, "rb") as f:
+            shutil.copyfileobj(f, self.wfile, 1024 * 1024)
+
+    def authorized(self, query):
+        """Checks API_KEY, sent as the X-Api-Key header or, for file links, as ?key=."""
+        if not API_KEY:
+            return True
+        given = self.headers.get("X-Api-Key") or query.get("key", [""])[0]
+        if secrets.compare_digest(given.encode(), API_KEY.encode()):
+            return True
+        self.send_json(401, {"error": "Senha de acesso inválida.", "auth": True})
+        return False
+
+    def read_json(self):
+        length = int(self.headers.get("Content-Length", 0))
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self.cors_headers()
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.end_headers()
+
     def do_GET(self):
-        if self.path == "/":
-            body = PAGE.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/jobs":
-            with JOBS_LOCK:
-                jobs = [dict(job, files=list(job["files"])) for job in JOBS.values()]
-            self.send_json(200, jobs[::-1])
-        else:
+        parsed = urlparse(self.path)
+        path, query = parsed.path, parse_qs(parsed.query)
+
+        if path in STATIC_FILES and (PUBLIC_DIR / STATIC_FILES[path]).exists():
+            name = STATIC_FILES[path]
+            self.send_file(PUBLIC_DIR / name, mimetypes.guess_type(name)[0] + "; charset=utf-8")
+            return
+        if path == "/api/health":
+            self.send_json(200, {"ok": True, "auth": bool(API_KEY)})
+            return
+        if not path.startswith("/api/"):
             self.send_json(404, {"error": "Not found"})
+            return
+        if not self.authorized(query):
+            return
+
+        if path == "/api/jobs":
+            # Each browser asks only for the jobs it created, so devices don't see each other's downloads
+            ids = [i for i in ",".join(query.get("ids", [])).split(",") if i]
+            with JOBS_LOCK:
+                jobs = [public_job(JOBS[i]) for i in ids if i in JOBS]
+            self.send_json(200, jobs)
+            return
+
+        # /api/jobs/<id>/files/<index> and /api/jobs/<id>/zip
+        parts = path.strip("/").split("/")
+        if len(parts) >= 4 and parts[:2] == ["api", "jobs"]:
+            with JOBS_LOCK:
+                job = JOBS.get(parts[2])
+                job = dict(job) if job else None
+            if not job or job["status"] != "done":
+                self.send_json(404, {"error": "Arquivo não encontrado ou expirado."})
+                return
+            job_dir = WORK_DIR / job["id"]
+            if parts[3] == "files" and len(parts) == 5 and parts[4].isdigit() and int(parts[4]) < len(job["files"]):
+                name = job["files"][int(parts[4])]
+                self.send_file(job_dir / name, "application/octet-stream", name)
+                return
+            if parts[3] == "zip" and len(parts) == 4:
+                archive = job_dir / "videos.zip"
+                if not archive.exists():
+                    tmp = job_dir / f"videos-{secrets.token_hex(4)}.tmp"
+                    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+                        for name in job["files"]:
+                            zf.write(job_dir / name, name)
+                    tmp.replace(archive)
+                self.send_file(archive, "application/zip", "videos.zip")
+                return
+        self.send_json(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path == "/api/playlist":
+        parsed = urlparse(self.path)
+        if not self.authorized(parse_qs(parsed.query)):
+            return
+        if parsed.path == "/api/playlist":
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                url = check_url(json.loads(self.rfile.read(length) or b"{}").get("url"))
+                url = check_url(self.read_json().get("url"))
                 self.send_json(200, list_playlist(url))
             except (ValueError, json.JSONDecodeError) as e:
                 self.send_json(400, {"error": str(e)})
             except Exception as e:
                 self.send_json(502, {"error": f"Não foi possível ler a playlist: {e}"})
             return
-        if self.path != "/api/download":
+        if parsed.path != "/api/download":
             self.send_json(404, {"error": "Not found"})
             return
         try:
-            length = int(self.headers.get("Content-Length", 0))
-            options = validate(json.loads(self.rfile.read(length) or b"{}"))
+            options = validate(self.read_json())
         except (ValueError, json.JSONDecodeError) as e:
             self.send_json(400, {"error": str(e)})
             return
 
-        job_id = uuid.uuid4().hex[:8]
+        job_id = secrets.token_hex(16)
         with JOBS_LOCK:
             JOBS[job_id] = {
                 "id": job_id,
                 "url": options["url"],
                 "label": payload_label(options),
                 "format": options["file_format"],
-                "status": "running",
+                "status": "queued",
                 "percent": None,
                 "current": "",
                 "files": [],
                 "error": None,
+                "finished_at": None,
             }
         threading.Thread(target=run_job, args=(job_id, options), daemon=True).start()
         self.send_json(202, {"id": job_id})
@@ -186,273 +333,24 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-PAGE = """<!doctype html>
-<html lang="pt-BR">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>YouTube Downloader</title>
-<style>
-  :root { --bg: #f5f5f7; --card: #fff; --text: #1d1d1f; --muted: #6e6e73; --accent: #d93025; --border: #d2d2d7; }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #111; --card: #1c1c1e; --text: #f5f5f7; --muted: #a1a1a6; --accent: #ff453a; --border: #3a3a3c; }
-  }
-  * { box-sizing: border-box; }
-  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
-  main { max-width: 760px; margin: 40px auto; padding: 0 16px; }
-  h1 { font-size: 1.5rem; margin-bottom: 24px; }
-  form, .job { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; }
-  label { display: block; font-size: .875rem; color: var(--muted); margin: 14px 0 6px; }
-  input[type=text], input[type=url], select { width: 100%; padding: 10px 12px; font-size: 1rem; border: 1px solid var(--border); border-radius: 8px; background: transparent; color: var(--text); }
-  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-  .check { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--text); font-size: .95rem; }
-  button { margin-top: 20px; width: 100%; padding: 12px; font-size: 1rem; font-weight: 600; border: 0; border-radius: 8px; background: var(--accent); color: #fff; cursor: pointer; }
-  button:disabled { opacity: .6; cursor: wait; }
-  .hint { font-size: .8rem; color: var(--muted); margin-top: 6px; }
-  .error { color: var(--accent); margin-top: 12px; min-height: 1em; }
-  #jobs { margin-top: 24px; display: grid; gap: 12px; }
-  .job { padding: 14px 16px; font-size: .9rem; }
-  .job .url { word-break: break-all; color: var(--muted); }
-  .bar { height: 6px; background: var(--border); border-radius: 3px; margin-top: 8px; overflow: hidden; }
-  .bar div { height: 100%; background: var(--accent); transition: width .3s; }
-  #playlist { margin-top: 16px; }
-  #playlist[hidden] { display: none; }
-  .pl-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin-bottom: 10px; }
-  .pl-head strong { flex: 1 1 100%; }
-  .pl-count { color: var(--muted); font-size: .875rem; flex: 1; }
-  .link { margin: 0; width: auto; padding: 4px 8px; background: transparent; color: var(--accent); font-size: .875rem; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 10px; max-height: 460px; overflow-y: auto; padding: 2px; }
-  .card { position: relative; border: 2px solid var(--border); border-radius: 10px; overflow: hidden; cursor: pointer; background: var(--bg); margin: 0; color: var(--text); font-size: .85rem; }
-  .card.selected { border-color: var(--accent); }
-  .card.disabled { opacity: .45; cursor: not-allowed; }
-  .card img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: var(--border); }
-  .card input { position: absolute; top: 8px; left: 8px; width: 18px; height: 18px; accent-color: var(--accent); }
-  .card .dur { position: absolute; top: 8px; right: 8px; background: rgba(0,0,0,.75); color: #fff; font-size: .75rem; padding: 1px 5px; border-radius: 4px; }
-  .card .title { margin: 8px; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-  .loading { color: var(--muted); font-size: .9rem; }
-</style>
-</head>
-<body>
-<main>
-  <h1>YouTube Downloader</h1>
-  <form id="form">
-    <label for="url">Link do vídeo ou playlist</label>
-    <input id="url" type="url" required placeholder="https://www.youtube.com/watch?v=...">
-    <div class="hint">Cole um link de playlist para escolher quais vídeos baixar.</div>
-    <div id="playlist" hidden></div>
-
-    <label for="format">Formato do arquivo</label>
-    <select id="format">
-      <optgroup label="Vídeo">
-        <option value="mp4" selected>MP4</option>
-        <option value="webm">WebM</option>
-        <option value="mkv">MKV</option>
-      </optgroup>
-      <optgroup label="Somente áudio">
-        <option value="mp3">MP3</option>
-        <option value="m4a">M4A</option>
-      </optgroup>
-    </select>
-
-    <div class="row">
-      <div>
-        <label for="start">Início (opcional)</label>
-        <input id="start" type="text" placeholder="00:01:30">
-      </div>
-      <div>
-        <label for="end">Fim (opcional)</label>
-        <input id="end" type="text" placeholder="00:02:45">
-      </div>
-    </div>
-    <div class="hint">Formato hh:mm:ss, mm:ss ou segundos. Deixe em branco para baixar o vídeo completo.</div>
-
-    <button id="submit" type="submit">Baixar</button>
-    <div class="error" id="error"></div>
-  </form>
-  <div id="jobs"></div>
-</main>
-<script>
-const form = document.getElementById("form");
-const errorEl = document.getElementById("error");
-const jobsEl = document.getElementById("jobs");
-const urlEl = document.getElementById("url");
-const playlistEl = document.getElementById("playlist");
-const STATUS = { running: "Baixando...", done: "Concluído", error: "Erro" };
-let playlist = null;      // { title, videos } of the loaded playlist
-let selected = new Set(); // ids of the selected videos
-let loadedUrl = "";
-let loadToken = 0;
-
-function playlistUrl(value) {
-  try {
-    const u = new URL(value.trim());
-    return u.searchParams.get("list") ? u.href : null;
-  } catch { return null; }
-}
-
-function fmtDuration(sec) {
-  if (sec == null) return "";
-  sec = Math.round(sec);
-  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
-  const mm = h ? String(m).padStart(2, "0") : m;
-  return (h ? h + ":" : "") + mm + ":" + String(s).padStart(2, "0");
-}
-
-async function loadPlaylist() {
-  const url = playlistUrl(urlEl.value);
-  if (url === loadedUrl) return;
-  loadedUrl = url;
-  playlist = null;
-  selected = new Set();
-  const token = ++loadToken;
-  if (!url) { playlistEl.hidden = true; playlistEl.innerHTML = ""; return; }
-  playlistEl.hidden = false;
-  playlistEl.innerHTML = '<div class="loading">Carregando vídeos da playlist...</div>';
-  try {
-    const res = await fetch("/api/playlist", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    });
-    const data = await res.json();
-    if (token !== loadToken) return;
-    if (!res.ok) throw new Error(data.error);
-    playlist = data;
-    // A watch link inside a playlist preselects just that video; a playlist link selects everything
-    const current = new URL(url).searchParams.get("v");
-    const available = data.videos.filter((v) => v.available);
-    const preselect = current && available.some((v) => v.id === current) ? [current] : available.map((v) => v.id);
-    selected = new Set(preselect);
-    renderPlaylist();
-  } catch (err) {
-    if (token !== loadToken) return;
-    playlistEl.innerHTML = '<div class="error">' + escape(err.message) + "</div>";
-  }
-}
-
-function renderPlaylist() {
-  playlistEl.innerHTML = `<div class="pl-head">
-      <strong>${escape(playlist.title)}</strong>
-      <span class="pl-count" id="pl-count"></span>
-      <button type="button" class="link" data-select="all">Selecionar todos</button>
-      <button type="button" class="link" data-select="none">Nenhum</button>
-    </div>
-    <div class="cards">${playlist.videos.map((v) => `
-      <label class="card${v.available ? "" : " disabled"}" data-id="${escape(v.id)}">
-        <img src="${escape(v.thumbnail)}" alt="" loading="lazy">
-        <input type="checkbox" ${v.available ? "" : "disabled"}>
-        ${v.duration ? `<span class="dur">${fmtDuration(v.duration)}</span>` : ""}
-        <div class="title" title="${escape(v.title)}">${escape(v.title)}</div>
-      </label>`).join("")}
-    </div>`;
-  syncSelection();
-}
-
-function syncSelection() {
-  playlistEl.querySelectorAll(".card").forEach((card) => {
-    const on = selected.has(card.dataset.id);
-    card.classList.toggle("selected", on);
-    card.querySelector("input").checked = on;
-  });
-  const count = playlistEl.querySelector("#pl-count");
-  if (count) count.textContent = selected.size + " de " + playlist.videos.length + " selecionados";
-}
-
-playlistEl.addEventListener("change", (e) => {
-  const card = e.target.closest(".card");
-  if (!card) return;
-  if (e.target.checked) selected.add(card.dataset.id); else selected.delete(card.dataset.id);
-  syncSelection();
-});
-
-playlistEl.addEventListener("click", (e) => {
-  const mode = e.target.dataset && e.target.dataset.select;
-  if (!mode || !playlist) return;
-  selected = new Set(mode === "all" ? playlist.videos.filter((v) => v.available).map((v) => v.id) : []);
-  syncSelection();
-});
-
-let debounce;
-urlEl.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(loadPlaylist, 400); });
-
-form.addEventListener("submit", async (e) => {
-  e.preventDefault();
-  errorEl.textContent = "";
-  if (playlistUrl(urlEl.value) && !playlist) {
-    errorEl.textContent = "Aguarde a lista de vídeos da playlist carregar.";
-    return;
-  }
-  const videos = playlist ? playlist.videos.filter((v) => selected.has(v.id)).map((v) => v.url) : [];
-  if (playlist && !videos.length) {
-    errorEl.textContent = "Selecione pelo menos um vídeo da playlist.";
-    return;
-  }
-  const button = document.getElementById("submit");
-  button.disabled = true;
-  try {
-    const res = await fetch("/api/download", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        url: urlEl.value,
-        videos,
-        format: document.getElementById("format").value,
-        start: document.getElementById("start").value,
-        end: document.getElementById("end").value,
-      }),
-    });
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error);
-    urlEl.value = "";
-    loadPlaylist();
-    refresh();
-  } catch (err) {
-    errorEl.textContent = err.message;
-  } finally {
-    button.disabled = false;
-  }
-});
-
-function escape(s) {
-  const div = document.createElement("div");
-  div.textContent = s == null ? "" : String(s);
-  return div.innerHTML;
-}
-
-async function refresh() {
-  const jobs = await (await fetch("/api/jobs")).json();
-  jobsEl.innerHTML = jobs.map((job) => {
-    const pct = job.percent == null ? 0 : job.percent;
-    const detail = job.status === "error" ? escape(job.error)
-      : job.status === "done" ? escape(job.files.join(", "))
-      : escape(job.current) + (job.percent == null ? "" : " (" + pct + "%)");
-    return `<div class="job">
-      <strong>${STATUS[job.status]}</strong> · ${escape(job.format.toUpperCase())}
-      <div class="url">${escape(job.label || job.url)}</div>
-      <div>${detail}</div>
-      ${job.status === "running" ? `<div class="bar"><div style="width:${pct}%"></div></div>` : ""}
-    </div>`;
-  }).join("");
-}
-
-setInterval(refresh, 1000);
-refresh();
-</script>
-</body>
-</html>
-"""
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Local web interface for the YouTube downloader.")
-    parser.add_argument("--port", type=int, default=8000)
+    parser = argparse.ArgumentParser(description="Web interface and API for the YouTube downloader.")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Address to listen on. Use 0.0.0.0 to accept other devices or when hosting it")
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
     parser.add_argument("--no-browser", action="store_true", help="Don't open the browser automatically")
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    shutil.rmtree(WORK_DIR, ignore_errors=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=cleanup_loop, daemon=True).start()
+
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
     url = f"http://127.0.0.1:{args.port}"
     print(f"Interface disponível em {url} (Ctrl+C para sair)")
-    if not args.no_browser:
+    if args.host not in ("127.0.0.1", "localhost"):
+        print(f"Aceitando conexões de outros dispositivos em {args.host}:{args.port}")
+    elif not args.no_browser:
         webbrowser.open(url)
     try:
         server.serve_forever()

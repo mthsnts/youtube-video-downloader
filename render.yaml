@@ -1,0 +1,12 @@
+# Render Blueprint for the backend. Fill ALLOWED_ORIGINS with your Netlify address after the first deploy.
+services:
+  - type: web
+    name: youtube-downloader-api
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/health
+    envVars:
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: API_KEY
+        sync: false
